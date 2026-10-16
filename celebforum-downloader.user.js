@@ -40,7 +40,7 @@
     }
 
     // CAMBIO: el slug del hilo sale de cualquier ruta, no solo de la página actual (la cola procesa otros hilos)
-    const fallbackOf = path => (path.match(/\/threads\/([^/]+)/) || [])[1] || 'set';
+    const fallbackOf = path => (path.match(/^\/[^/]+\/([^/]+\.\d+)(?:\/|$)/) || [])[1] || 'set';
     const threadFallback = fallbackOf(location.pathname);
 
     // nombre de la carpeta del hilo = .threadTitle (o el título de XenForo / el slug de la URL)
@@ -335,7 +335,8 @@
     btnStop.onclick = () => requestPause('all');
     resetPauseButtons();
     // NUEVO: fuera de un hilo (portada, buscador…) la pestaña es solo un gestor de la cola: sin botones de descarga del hilo
-    const inThread = /\/threads\//.test(location.pathname);
+    // un hilo de XenForo es /<sección>/<nombre>.<número>/ (en este foro la sección es "themen", en otros "threads")
+    const inThread = /^\/[^/]+\/[^/]+\.\d+(?:\/|$)/.test(location.pathname);
     if (!inThread) { btn.style.display = 'none'; btnAll.style.cssText += ';opacity:.85;cursor:default'; }
     // NUEVO: interruptor — al terminar un hilo, continuar solo con la cola guardada (se recuerda entre sesiones; por defecto activado)
     const autoBox = document.createElement('label');

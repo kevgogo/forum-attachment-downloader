@@ -1,9 +1,13 @@
 // ==UserScript==
 // @name         Celebforum downloader
 // @namespace    http://tampermonkey.net/
-// @version      2026-10-16
+// @version      2026.10.16.1
 // @description  try to take over the world!
-// @author       You
+// @author       kevgogo
+// @homepageURL  https://github.com/kevgogo/forum-attachment-downloader
+// @supportURL   https://github.com/kevgogo/forum-attachment-downloader/issues
+// @updateURL    https://raw.githubusercontent.com/kevgogo/forum-attachment-downloader/main/celebforum-downloader.user.js
+// @downloadURL  https://raw.githubusercontent.com/kevgogo/forum-attachment-downloader/main/celebforum-downloader.user.js
 // @match        https://celebforum.cc/*
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=celebforum.cc
 // @grant        none

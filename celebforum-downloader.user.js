@@ -39,7 +39,9 @@
             .slice(0, 100);
     }
 
-    const threadFallback = (location.pathname.match(/\/threads\/([^/]+)/) || [])[1] || 'set';
+    // CAMBIO: el slug del hilo sale de cualquier ruta, no solo de la página actual (la cola procesa otros hilos)
+    const fallbackOf = path => (path.match(/\/threads\/([^/]+)/) || [])[1] || 'set';
+    const threadFallback = fallbackOf(location.pathname);
 
     // nombre de la carpeta del hilo = .threadTitle (o el título de XenForo / el slug de la URL)
     function threadName() {
@@ -50,47 +52,70 @@
 
     // un grupo (carpeta) por cada post con .bbWrapper y adjuntos
     // ctx = { seenUrls, usedNames } se comparte entre páginas para no repetir URLs ni carpetas
-    function groups(doc, ctx) {
+    // CAMBIO: fallback = slug del hilo al que pertenece el documento
+    // NUEVO: paso 1 — posts de UNA página tal cual (sin deduplicar entre páginas); es lo que se guarda en caché
+    function extractPosts(doc) {
         const out = [];
         doc.querySelectorAll('.bbWrapper').forEach((w, i) => {
             // los adjuntos de XenForo suelen estar fuera del .bbWrapper, dentro del mismo post
             const root = w.closest('article.message') || w.closest('.message-body') || w.parentElement;
-            const urls = collect(root).filter(u => !ctx.seenUrls.has(u));
+            const urls = collect(root);
             if (!urls.length) return;
-            urls.forEach(u => ctx.seenUrls.add(u));
-            const title = firstLine(w);
-            const base = cleanName(title) || `${threadFallback}-${i + 1}`;
-            let name = base;
-            let n = 2;
-            while (ctx.usedNames.has(name)) name = `${base} (${n++})`;
-            ctx.usedNames.add(name);
-            // NUEVO: datos del post para el manifest.json
+            // datos del post para el manifest.json
             const postId = ((root.dataset && root.dataset.content) || '').replace(/^post-/, '');
             out.push({
-                name, urls, title,
+                i, urls, title: firstLine(w),
                 postId: postId ? `post-${postId}` : '',
                 postUrl: postId ? `${location.origin}/posts/${postId}/` : ''
             });
         });
         if (!out.length) { // sin .bbWrapper con adjuntos: todo en una sola carpeta
-            const urls = collect(doc).filter(u => !ctx.seenUrls.has(u));
-            if (urls.length) {
-                urls.forEach(u => ctx.seenUrls.add(u));
-                out.push({ name: threadFallback, urls, title: '', postId: '', postUrl: '' });
-            }
+            const urls = collect(doc);
+            if (urls.length) out.push({ i: 0, urls, title: '', postId: '', postUrl: '', whole: true });
         }
         return out;
+    }
+
+    // NUEVO: paso 2 — deduplica URLs y asigna nombres de carpeta únicos entre páginas
+    // ctx = { seenUrls, usedNames } se comparte entre páginas para no repetir URLs ni carpetas
+    function applyCtx(raw, ctx, fallback) {
+        const out = [];
+        raw.forEach(p => {
+            const urls = p.urls.filter(u => !ctx.seenUrls.has(u));
+            if (!urls.length) return;
+            urls.forEach(u => ctx.seenUrls.add(u));
+            const base = p.whole ? fallback : (cleanName(p.title) || `${fallback}-${p.i + 1}`);
+            let name = base;
+            let n = 2;
+            while (ctx.usedNames.has(name)) name = `${base} (${n++})`;
+            ctx.usedNames.add(name);
+            out.push({ name, urls, title: p.title, postId: p.postId, postUrl: p.postUrl });
+        });
+        return out;
+    }
+
+    // un grupo (carpeta) por cada post con .bbWrapper y adjuntos
+    // CAMBIO: fallback = slug del hilo al que pertenece el documento
+    function groups(doc, ctx, fallback = threadFallback) {
+        return applyCtx(extractPosts(doc), ctx, fallback);
     }
 
     // paginado — base del hilo, página actual y última página
     const threadBase = location.pathname.replace(/\/page-\d+\/?$/, '').replace(/\/$/, '');
     const currentPage = Number((location.pathname.match(/\/page-(\d+)/) || [])[1] || 1);
-    const pageUrl = p => `${location.origin}${threadBase}/` + (p > 1 ? `page-${p}` : '');
+    const pageUrl = (tb, p) => `${location.origin}${tb}/` + (p > 1 ? `page-${p}` : ''); // CAMBIO: recibe el hilo
     function lastPage() {
         const nums = [...document.querySelectorAll('.pageNav-main a, .pageNav-page a')]
             .map(a => parseInt(a.textContent, 10)).filter(Number.isFinite);
         return Math.max(currentPage, ...nums, 1);
     }
+
+    // NUEVO: descriptor de un hilo para procesarlo (el actual o uno guardado en la cola)
+    const mkThread = (tb, title, url, pages) => ({
+        threadBase: tb, title: title || cleanName(fallbackOf(tb)), url, pages,
+        fallback: fallbackOf(tb), isCurrent: tb === threadBase
+    });
+    const curThread = pages => mkThread(threadBase, threadName(), `${location.origin}${threadBase}/`, pages);
 
     // ===== persistencia =====
 
@@ -124,42 +149,70 @@
     const idbGet = async k => { const db = await idb(); return new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').get(k); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); };
     const idbSet = async (k, v) => { const db = await idb(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').put(v, k); t.oncomplete = () => res(); t.onerror = () => rej(t.error); }); };
 
-    // CAMBIO: todo por hilo, así varias pestañas con hilos distintos no se pisan
-    const JOB_KEY = `cfdl_job:${threadBase}`;   // localStorage: trabajo pendiente de este hilo
-    const BASE_KEY = `base:${threadBase}`;      // IndexedDB: carpeta base usada por este hilo
-    const loadJob = () => { try { return JSON.parse(localStorage.getItem(JOB_KEY)); } catch (e) { return null; } };
-    // NUEVO: cola guardada (orden de llegada) para sobrevivir a caídas; una sola clave para todos los hilos
+    const idbDel = async k => { const db = await idb(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').delete(k); t.oncomplete = () => res(); t.onerror = () => rej(t.error); }); };
+
+    // NUEVO: caché del escaneo por hilo (IndexedDB): qué páginas ya se leyeron y qué adjuntos tenían
+    const scanKey = tb => `scan:${tb}`;
+    const SCAN_TTL = 3 * 24 * 3600 * 1000; // pasado este tiempo se vuelve a leer (el hilo pudo cambiar)
+
+    // CAMBIO: claves por hilo (parámetro) para poder trabajar con cualquier hilo de la cola
+    const jobKey = tb => `cfdl_job:${tb}`;   // localStorage: trabajo pendiente del hilo
+    const baseKey = tb => `base:${tb}`;      // IndexedDB: carpeta base usada por el hilo
+    const loadJob = tb => { try { return JSON.parse(localStorage.getItem(jobKey(tb))); } catch (e) { return null; } };
+
+    // cola guardada (orden de llegada) para sobrevivir a caídas; una sola clave para todos los hilos
     const QUEUE_KEY = 'cfdl_queue';
     const loadQueue = () => { try { const q = JSON.parse(localStorage.getItem(QUEUE_KEY)); return Array.isArray(q) ? q : []; } catch (e) { return []; } };
     const storeQueue = q => { try { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); } catch (e) { /* sin storage */ } };
-    const queueAdd = pages => {
+    const queueAdd = T => {
         const q = loadQueue();
-        const i = q.findIndex(x => x.threadBase === threadBase);
-        const entry = { threadBase, url: `${location.origin}${threadBase}/`, title: threadName(), pages, ts: i >= 0 ? q[i].ts : Date.now() };
+        const i = q.findIndex(x => x.threadBase === T.threadBase);
+        const entry = { threadBase: T.threadBase, url: T.url, title: T.title, pages: T.pages, ts: i >= 0 ? q[i].ts : Date.now() };
         if (i >= 0) q[i] = entry; else q.push(entry); // si ya estaba, conserva su lugar
         storeQueue(q);
     };
     const queueRemove = tb => storeQueue(loadQueue().filter(x => x.threadBase !== tb));
 
-    const saveJob = pages => {
-        try { localStorage.setItem(JOB_KEY, JSON.stringify({ threadBase, pages })); } catch (e) { /* sin storage */ }
-        queueAdd(pages);
+    const saveJob = T => {
+        // CAMBIO: conserva el progreso ya guardado si es el mismo trabajo (al reanudar no se pone a cero)
+        const prev = loadJob(T.threadBase);
+        const same = prev && JSON.stringify(prev.pages) === JSON.stringify(T.pages);
+        try { localStorage.setItem(jobKey(T.threadBase), JSON.stringify({ threadBase: T.threadBase, pages: T.pages, progress: same ? prev.progress : undefined })); } catch (e) { /* sin storage */ }
+        queueAdd(T);
     };
-    const clearJob = () => {
-        try { localStorage.removeItem(JOB_KEY); } catch (e) { /* sin storage */ }
-        queueRemove(threadBase);
+    // NUEVO: resumen de progreso en localStorage (visible desde la consola y en el panel)
+    const saveProgress = (tb, patch) => {
+        const job = loadJob(tb);
+        if (!job) return;
+        job.progress = Object.assign(job.progress || {}, patch, { updatedAt: Date.now() });
+        try { localStorage.setItem(jobKey(tb), JSON.stringify(job)); } catch (e) { /* sin storage */ }
+    };
+    const progressText = (job, np) => {
+        const p = job && job.progress;
+        if (!p) return '';
+        return ` · leídas ${p.pagesRead || 0}/${p.pagesTotal || np}` + (p.imgTotal ? ` · ${p.imgOk || 0}/${p.imgTotal} img` : '');
+    };
+    const clearJob = tb => {
+        try { localStorage.removeItem(jobKey(tb)); } catch (e) { /* sin storage */ }
+        queueRemove(tb);
+        idbDel(scanKey(tb)).catch(() => { /* sin caché que borrar */ }); // terminó o se canceló: la caché ya no sirve
     };
 
-    // NUEVO: candados entre pestañas (Web Locks)
-    const THREAD_LOCK = `cfdl-thread:${threadBase}`; // el mismo hilo no puede correr dos veces
-    const GLOBAL_LOCK = 'cfdl-global';                // cola global: una descarga a la vez en todo el sitio
-    async function withLocks(fn, onQueued) {
+    // candados entre pestañas (Web Locks)
+    const threadLock = tb => `cfdl-thread:${tb}`; // el mismo hilo no puede correr dos veces
+    const GLOBAL_LOCK = 'cfdl-global';             // cola global: una descarga a la vez en todo el sitio
+    async function withLocks(T, fn, onQueued) {
         if (!navigator.locks) { await onQueued(); return fn(); } // sin Web Locks: sin cola
-        return navigator.locks.request(THREAD_LOCK, { ifAvailable: true }, async tl => {
+        return navigator.locks.request(threadLock(T.threadBase), { ifAvailable: true }, async tl => {
             if (!tl) throw new Error('THREAD_BUSY');
             await onQueued();
             return navigator.locks.request(GLOBAL_LOCK, fn); // espera su turno en orden de llegada
         });
+    }
+    async function isThreadBusy(tb) {
+        if (!navigator.locks) return false;
+        const q = await navigator.locks.query();
+        return [...q.held, ...q.pending].some(l => l.name === threadLock(tb));
     }
 
     // Wake Lock (evita que la pantalla/equipo se suspenda por inactividad)
@@ -176,12 +229,39 @@
     // aviso antes de cerrar/recargar mientras corre
     window.addEventListener('beforeunload', e => { if (running) { e.preventDefault(); e.returnValue = ''; } });
 
-    // fetch que pausa y reintenta si Cloudflare muestra el desafío
+    // fetch que pausa y reintenta si Cloudflare muestra el desafío o el foro redirige a /captcha_verify/
+    const isBlocked = r => r.headers.get('cf-mitigated') === 'challenge' || /\/captcha_verify/.test(r.url); // fetch sigue la redirección: r.url es la final
+
+    // CAMBIO: un solo aviso a la vez, sin window.open ni alert (el navegador bloquea las ventanas emergentes sin gesto).
+    // Se muestra un enlace en la página; al resolver el captcha se detecta solo y se reanuda.
+    let gate = null; // promesa del desafío en curso: todos los que choquen con él esperan la misma
+    function waitForChallenge(url, blockedRes) {
+        if (gate) return gate;
+        const cap = /\/captcha_verify/.test(blockedRes.url);
+        gate = (async () => {
+            noticeLink.href = cap ? blockedRes.url : url;
+            noticeText.textContent = cap
+                ? 'El foro pide un captcha. Ábrelo, resuélvelo y vuelve: continúa solo.'
+                : 'Cloudflare pide verificación. Ábrela, resuélvela y vuelve: continúa solo.';
+            notice.style.display = '';
+            btnAll.textContent = '⚠ Captcha pendiente (esperando que lo resuelvas)';
+            for (;;) {
+                await sleep(6000); // sondeo suave: una petición cada 6 s
+                try {
+                    const r = await fetch(url, { credentials: 'include' });
+                    try { if (r.body) r.body.cancel(); } catch (e) { /* no importa */ }
+                    if (!isBlocked(r)) break;
+                } catch (e) { /* sin red: sigue esperando */ }
+            }
+            notice.style.display = 'none';
+        })().finally(() => { gate = null; });
+        return gate;
+    }
+
     async function fetchRetry(url) {
         let res = await fetch(url, { credentials: 'include' });
-        while (res.headers.get('cf-mitigated') === 'challenge') {
-            window.open(url, '_blank');
-            alert('Cloudflare pide verificación. Resuélvela en la pestaña que se abrió, ciérrala y pulsa Aceptar para continuar.');
+        while (isBlocked(res)) {
+            await waitForChallenge(url, res);
             res = await fetch(url, { credentials: 'include' });
         }
         return res;
@@ -191,26 +271,67 @@
     box.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:99999;display:flex;flex-direction:column;gap:6px';
     const btn = document.createElement('button');    // página actual (el de siempre)
     const btnAll = document.createElement('button'); // hilo completo / rango de páginas
+    const btnQueue = document.createElement('button');   // NUEVO: procesar la cola guardada desde esta pestaña
     const btnResume = document.createElement('button');  // reanudar trabajo pendiente
     const btnDiscard = document.createElement('button'); // descartar trabajo pendiente
-    [btn, btnAll, btnResume, btnDiscard].forEach(b => { b.style.cssText = 'padding:8px 12px'; box.appendChild(b); });
-    btnResume.style.display = btnDiscard.style.display = 'none';
+    [btn, btnAll, btnQueue, btnResume, btnDiscard].forEach(b => { b.style.cssText = 'padding:8px 12px'; box.appendChild(b); });
+    btnQueue.style.display = btnResume.style.display = btnDiscard.style.display = 'none';
     btnDiscard.textContent = 'Descartar descarga pendiente';
-    // NUEVO: panel con el orden de la cola global (visible en todas las pestañas)
+    // panel con el orden de la cola global (visible en todas las pestañas)
     const panel = document.createElement('div');
     panel.style.cssText = 'display:none;max-width:320px;padding:8px 12px;font:12px/1.4 sans-serif;background:#222;color:#eee;border-radius:6px;white-space:pre-wrap';
     box.appendChild(panel);
+    // NUEVO: aviso visible cuando el foro/Cloudflare pide verificación (reemplaza a window.open + alert)
+    const notice = document.createElement('div');
+    notice.style.cssText = 'display:none;max-width:320px;padding:10px 12px;font:13px/1.4 sans-serif;background:#b45309;color:#fff;border-radius:6px';
+    const noticeText = document.createElement('div');
+    const noticeLink = document.createElement('a');
+    noticeLink.target = '_blank'; noticeLink.textContent = 'Abrir verificación ↗';
+    noticeLink.style.cssText = 'display:inline-block;margin-top:6px;color:#fff;font-weight:bold';
+    notice.append(noticeText, noticeLink);
+    box.prepend(notice);
     document.body.appendChild(box);
 
-    let myId = null; // mi clientId de Web Locks (se conoce al entrar a la cola)
+    let myId = null;   // mi clientId de Web Locks (se conoce al entrar a la cola)
+    let active = null; // NUEVO: hilo que esta pestaña está procesando ahora
+    const batchTbs = new Set(); // NUEVO: hilos de la tanda de esta pestaña que aún no terminan
     const bc = (() => { try { return new BroadcastChannel('cfdl-status'); } catch (e) { return null; } })();
-    const peers = new Map(); // clientId -> { title, text, seen }: lo que cada pestaña anuncia de sí misma
+    const peers = new Map(); // clientId -> { title, text, tb, seen }: lo que cada pestaña anuncia de sí misma
     if (bc) bc.onmessage = e => {
         const m = e.data;
         if (!m || !m.me) return;
         if (m.gone) peers.delete(m.me); else peers.set(m.me, { title: m.title, text: m.text, tb: m.tb, seen: Date.now() });
     };
-    const announce = () => { if (bc && myId) bc.postMessage({ me: myId, tb: threadBase, title: threadName(), text: btnAll.textContent }); };
+    const announce = () => { if (bc && myId && active) bc.postMessage({ me: myId, tb: active.threadBase, title: active.title, text: btnAll.textContent }); };
+
+    // hilos guardados en la cola que ninguna pestaña (ni esta) está atendiendo ahora
+    function candidates() {
+        const live = new Set(batchTbs);
+        peers.forEach(p => { if (Date.now() - p.seen < 10000 && p.tb) live.add(p.tb); });
+        if (myId && active) live.add(active.threadBase);
+        return loadQueue().filter(x => !live.has(x.threadBase));
+    }
+
+    // NUEVO: reordenar la cola guardada (solo afecta a los pendientes sin pestaña; el orden de la cola viva no se puede cambiar)
+    function moveInQueue(tb, dir) {
+        const q = loadQueue();
+        const cand = new Set(candidates().map(x => x.threadBase));
+        const i = q.findIndex(x => x.threadBase === tb);
+        if (i < 0) return;
+        let j = i + dir;
+        while (j >= 0 && j < q.length && !cand.has(q[j].threadBase)) j += dir; // salta los que están en curso
+        if (j < 0 || j >= q.length) return;
+        [q[i], q[j]] = [q[j], q[i]];
+        storeQueue(q);
+    }
+    function sortQueueByPages(asc) {
+        const q = loadQueue();
+        const cand = new Set(candidates().map(x => x.threadBase));
+        const slots = q.map((x, i) => (cand.has(x.threadBase) ? i : -1)).filter(i => i >= 0);
+        const sorted = slots.map(i => q[i]).sort((a, b) => ((a.pages || []).length - (b.pages || []).length) * (asc ? 1 : -1));
+        slots.forEach((qi, k) => { q[qi] = sorted[k]; });
+        storeQueue(q);
+    }
 
     async function renderQueue() {
         let held = [], pend = [];
@@ -221,11 +342,12 @@
                 pend = s.pending.filter(l => l.name === GLOBAL_LOCK);
             } catch (e) { /* sin consulta de cola */ }
         }
-        // NUEVO: hilos guardados en la cola que ninguna pestaña está atendiendo ahora (p. ej. tras una caída)
-        const live = new Set();
-        peers.forEach(p => { if (Date.now() - p.seen < 10000 && p.tb) live.add(p.tb); });
-        if (myId) live.add(threadBase);
-        const saved = loadQueue().filter(x => !live.has(x.threadBase) && x.threadBase !== threadBase);
+        const cands = candidates();
+        const saved = cands; // CAMBIO: incluye el hilo actual para poder reordenarlo o cancelarlo desde la lista
+
+        // NUEVO: botón para procesar toda la cola guardada desde esta pestaña
+        btnQueue.style.display = (!running && cands.length) ? '' : 'none';
+        btnQueue.textContent = `Procesar cola guardada (${cands.length} ${cands.length === 1 ? 'hilo' : 'hilos'})`;
 
         if (!held.length && !pend.length && !saved.length) { panel.style.display = 'none'; return; }
 
@@ -234,7 +356,7 @@
             const fresh = p && Date.now() - p.seen < 10000; // anuncio reciente
             const mine = l.clientId === myId;
             return {
-                name: mine ? `${threadName()} (esta pestaña)` : (fresh ? p.title : 'otra pestaña'),
+                name: mine ? `${active ? active.title : threadName()} (esta pestaña)` : (fresh ? p.title : 'otra pestaña'),
                 text: mine ? btnAll.textContent : (fresh ? p.text : '')
             };
         };
@@ -246,23 +368,39 @@
             pend.forEach((l, i) => add(`${i + 1}. ${info(l).name}`));
         }
         if (saved.length) {
-            const h = add('Pendientes guardados (abre el hilo para reanudar):');
+            const h = add('Pendientes guardados (abre el hilo o usa "Procesar cola"):');
             h.style.fontWeight = 'bold';
             if (held.length || pend.length) h.style.marginTop = '6px';
+            // enlace-acción pequeño (▲ ▼ ✕ y orden por páginas)
+            const act = (txt, title, fn, color) => {
+                const l = document.createElement('a');
+                l.href = '#'; l.textContent = txt; l.title = title;
+                l.style.cssText = `color:${color || '#ccc'};text-decoration:none;margin-left:6px`;
+                l.onclick = ev => { ev.preventDefault(); fn(); renderQueue(); };
+                return l;
+            };
+            if (saved.length > 1) {
+                const s = document.createElement('div');
+                s.append('Ordenar por páginas:',
+                    act('menos primero ▲', 'De menos a más páginas', () => sortQueueByPages(true), '#8cf'),
+                    act('más primero ▼', 'De más a menos páginas', () => sortQueueByPages(false), '#8cf'));
+                frag.appendChild(s);
+            }
             saved.forEach((x, i) => {
                 const d = document.createElement('div');
                 const a = document.createElement('a');
                 a.href = x.url; a.target = '_blank'; a.style.color = '#8cf'; // pestaña nueva: no interrumpe una descarga en curso
-                a.textContent = `${i + 1}. ${x.title || x.threadBase}`;
-                const rm = document.createElement('a');
-                rm.href = '#'; rm.textContent = ' ✕'; rm.title = 'Quitar de la cola'; rm.style.cssText = 'color:#f88;text-decoration:none';
-                rm.onclick = ev => {
-                    ev.preventDefault();
-                    queueRemove(x.threadBase);
-                    try { localStorage.removeItem(`cfdl_job:${x.threadBase}`); } catch (e) { /* sin storage */ }
-                    renderQueue();
-                };
-                d.append(a, rm);
+                const np = (x.pages || []).length;
+                a.textContent = `${i + 1}. ${x.title || x.threadBase}${x.threadBase === threadBase ? ' (este hilo)' : ''} — ${np} ${np === 1 ? 'pág' : 'págs'}${progressText(loadJob(x.threadBase), np)}`;
+                d.append(
+                    a,
+                    act('▲', 'Subir en la cola', () => moveInQueue(x.threadBase, -1)),
+                    act('▼', 'Bajar en la cola', () => moveInQueue(x.threadBase, +1)),
+                    act('✕', 'Quitar de la cola (cancelar)', () => {
+                        clearJob(x.threadBase);
+                        if (x.threadBase === threadBase) btnResume.style.display = btnDiscard.style.display = 'none';
+                    }, '#f88')
+                );
                 frag.appendChild(d);
             });
         }
@@ -282,11 +420,12 @@
     refresh();
     setTimeout(refresh, 3000); // una segunda pasada cuando termina la carga diferida
 
-    // CAMBIO: el trabajo en sí se separó de run() para poder ejecutarlo dentro de la cola global
-    async function doRun(base, pages) {
+    // CAMBIO: el trabajo recibe el hilo T (actual o de la cola) en vez de leer la página abierta
+    async function doRun(base, T) {
+        const pages = T.pages;
         btnAll.textContent = 'Iniciando...';
         let threadDir = null, manifest = null;
-        // NUEVO: escribe manifest.json en la carpeta del hilo
+        // escribe manifest.json en la carpeta del hilo
         const writeManifest = async () => {
             manifest.updatedAt = new Date().toISOString();
             manifest.sets.forEach(s => s.files.sort((a, b) => a.file.localeCompare(b.file)));
@@ -297,42 +436,58 @@
         };
         try {
             // carpeta del hilo dentro de la carpeta elegida; los sets van dentro de ella
-            threadDir = await base.getDirectoryHandle(threadName(), { create: true });
-            // NUEVO: si ya hay un manifest.json de ejecuciones anteriores, se combina con el nuevo
+            threadDir = await base.getDirectoryHandle(cleanName(T.title) || cleanName(T.fallback), { create: true });
+            // si ya hay un manifest.json de ejecuciones anteriores, se combina con el nuevo
             try {
                 manifest = JSON.parse(await (await (await threadDir.getFileHandle('manifest.json')).getFile()).text());
             } catch (e) { manifest = null; }
             if (!manifest || typeof manifest !== 'object') manifest = {};
             manifest.thread = {
-                title: threadName(),
-                url: `${location.origin}${threadBase}/`,
+                title: T.title,
+                url: T.url,
                 pages: [...new Set([...((manifest.thread && manifest.thread.pages) || []), ...pages])].sort((a, b) => a - b)
             };
             if (!Array.isArray(manifest.sets)) manifest.sets = [];
             const ctx = { seenUrls: new Set(), usedNames: new Set() };
             const all = [];
+            // NUEVO: caché del escaneo — las páginas ya leídas en una ejecución anterior no se vuelven a pedir
+            let scan = null;
+            try { scan = await idbGet(scanKey(T.threadBase)); } catch (e) { /* sin IndexedDB */ }
+            if (!scan || !scan.pages || Date.now() - scan.ts > SCAN_TTL) scan = { ts: Date.now(), pages: {} };
             for (const p of pages) {
-                btnAll.textContent = `Leyendo página ${p}...`;
-                let doc = document;
-                if (p !== currentPage) {
-                    try {
-                        const res = await fetchRetry(pageUrl(p));
-                        if (!res.ok) { console.warn('[adjuntos] página fallo', p, res.status); continue; }
-                        doc = new DOMParser().parseFromString(await res.text(), 'text/html');
-                    } catch (e) {
-                        console.error('[adjuntos] error página', p, e);
-                        continue;
+                let raw = scan.pages[p];
+                if (raw) {
+                    btnAll.textContent = `Página ${p} ya leída (caché)`;
+                } else {
+                    btnAll.textContent = `Leyendo página ${p}...`;
+                    let doc = document;
+                    if (!(T.isCurrent && p === currentPage)) {
+                        try {
+                            const res = await fetchRetry(pageUrl(T.threadBase, p));
+                            if (!res.ok) { console.warn('[adjuntos] página fallo', p, res.status); continue; } // no se cachea: se reintenta al reanudar
+                            doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+                        } catch (e) {
+                            console.error('[adjuntos] error página', p, e);
+                            continue;
+                        }
+                        await sleep(1500);
                     }
-                    await sleep(1500);
+                    raw = extractPosts(doc);
+                    scan.pages[p] = raw;
+                    try { await idbSet(scanKey(T.threadBase), scan); } catch (e) { /* sin IndexedDB */ }
                 }
-                all.push(...groups(doc, ctx));
+                all.push(...applyCtx(raw, ctx, T.fallback));
+                saveProgress(T.threadBase, { pagesRead: pages.filter(q => scan.pages[q]).length, pagesTotal: pages.length });
             }
             const total = all.reduce((s, x) => s + x.urls.length, 0);
             let ok = 0;
+            // NUEVO: progreso de imágenes en localStorage (cada 10, y al cerrar cada set)
+            const tick = force => { if (force || ok % 10 === 0) saveProgress(T.threadBase, { imgOk: ok, imgTotal: total, setsTotal: all.length }); };
+            tick(true);
             const failed = []; // imágenes que no se pudieron guardar tras los reintentos
             for (const { name: setFolder, urls, title, postId, postUrl } of all) {
                 const dir = await threadDir.getDirectoryHandle(setFolder, { create: true });
-                // NUEVO: entrada del set en el manifest (se reutiliza si ya existía)
+                // entrada del set en el manifest (se reutiliza si ya existía)
                 let entry = manifest.sets.find(s => s.folder === setFolder);
                 if (!entry) { entry = { folder: setFolder, files: [] }; manifest.sets.push(entry); }
                 Object.assign(entry, { postId, postUrl, title });
@@ -347,7 +502,7 @@
                     // retomar — si el archivo ya existe y no está vacío, se salta
                     try {
                         const f = await (await dir.getFileHandle(fileName)).getFile();
-                        if (f.size > 0) { mark(fileName, url, 'ok'); btnAll.textContent = `Guardados ${++ok}/${total}`; continue; }
+                        if (f.size > 0) { mark(fileName, url, 'ok'); btnAll.textContent = `Guardados ${++ok}/${total}`; tick(); continue; }
                     } catch (e) { /* no existe todavía */ }
 
                     // hasta 3 intentos con espera creciente
@@ -367,6 +522,7 @@
                                 await w.close();
                                 mark(fileName, url, 'ok');
                                 btnAll.textContent = `Guardados ${++ok}/${total}`;
+                                tick();
                                 saved = true;
                             }
                         } catch (e) {
@@ -377,12 +533,13 @@
                     if (!saved) { mark(fileName, url, 'failed'); failed.push({ carpeta: setFolder, archivo: fileName, url }); }
                     await sleep(800);
                 }
-                await writeManifest(); // NUEVO: se actualiza al terminar cada set
+                tick(true);
+                await writeManifest(); // se actualiza al terminar cada set
             }
             await writeManifest();
             btnAll.textContent = `Listo: ${ok}/${total} en ${all.length} carpetas` + (failed.length ? ` — ${failed.length} fallaron (ver consola)` : '');
             if (failed.length) console.table(failed);
-            clearJob(); // terminó con normalidad: ya no hay nada pendiente
+            clearJob(T.threadBase); // terminó con normalidad: ya no hay nada pendiente
         } catch (e) {
             // error inesperado (p. ej. permiso de carpeta): el trabajo queda pendiente para reanudar
             console.error('[adjuntos] detenido', e);
@@ -391,53 +548,23 @@
         }
     }
 
-    // recibe la lista de páginas a procesar y, al reanudar, el handle guardado
-    async function run(pages, handle) {
-        if (running) return;
-        // NUEVO: aviso temprano si este hilo ya corre (o está en cola) en otra pestaña
-        if (navigator.locks) {
-            const q = await navigator.locks.query();
-            if ([...q.held, ...q.pending].some(l => l.name === THREAD_LOCK)) {
-                alert('Este hilo ya se está descargando (o está en cola) en otra pestaña.');
-                return;
-            }
-        }
-        let base = handle;
-        if (!base) {
-            // elegir carpeta base (antes de cualquier await largo, para conservar el gesto del usuario)
-            try {
-                let startIn;
-                try { startIn = await idbGet('base:last'); } catch (e) { /* sin IndexedDB */ }
-                base = await window.showDirectoryPicker(startIn ? { mode: 'readwrite', startIn } : { mode: 'readwrite' });
-            } catch (e) {
-                console.warn('[adjuntos] carpeta no elegida', e);
-                return;
-            }
-        }
-        // recordarla para reanudar tras recargar (por hilo) y como punto de partida del próximo selector
-        try { await idbSet(BASE_KEY, base); await idbSet('base:last', base); } catch (e) { /* sin IndexedDB */ }
-
-        running = true;
-        btnResume.style.display = btnDiscard.style.display = 'none';
-
-        // NUEVO: el título de la pestaña refleja el estado (cola / progreso) para verlo sin abrirla
-        const baseTitle = document.title;
-        const titleTimer = setInterval(() => { document.title = `${btnAll.textContent} · ${baseTitle}`; }, 1000);
-        // NUEVO: posición en la cola global, consultada cada 2 s mientras espera
-        let poll = null;
+    // NUEVO: procesa UN hilo dentro de los candados (cola global + candado del hilo)
+    async function runOne(T, b) {
+        // recordar la carpeta para reanudar (por hilo) y como punto de partida del próximo selector
+        try { await idbSet(baseKey(T.threadBase), b); await idbSet('base:last', b); } catch (e) { /* sin IndexedDB */ }
+        active = T;
+        let poll = null, announceTimer = null;
         const stopPoll = () => { if (poll) clearInterval(poll); poll = null; };
-        let announceTimer = null; // NUEVO: anuncia mi estado a las demás pestañas para el panel
-
         try {
             await withLocks(
-                async () => { stopPoll(); return doRun(base, pages); },
+                T,
+                async () => { stopPoll(); return doRun(b, T); },
                 async () => {
-                    saveJob(pages); // queda registrado desde que entra a la cola
-                    lockOn();
+                    saveJob(T); // queda registrado desde que entra a la cola
                     btnAll.textContent = 'En cola: esperando a otra descarga...';
                     try {
                         // mi clientId = quien tiene el candado de este hilo (solo yo lo tengo)
-                        const me = ((await navigator.locks.query()).held.find(l => l.name === THREAD_LOCK) || {}).clientId;
+                        const me = ((await navigator.locks.query()).held.find(l => l.name === threadLock(T.threadBase)) || {}).clientId;
                         myId = me || null;
                         announce();
                         announceTimer = setInterval(announce, 2000);
@@ -451,14 +578,46 @@
                     } catch (e) { /* sin posición: queda el mensaje genérico */ }
                 }
             );
-        } catch (e) {
-            if (e && e.message === 'THREAD_BUSY') alert('Este hilo ya se está descargando (o está en cola) en otra pestaña.');
-            else console.error('[adjuntos] error', e);
         } finally {
             stopPoll();
             if (announceTimer) clearInterval(announceTimer);
             if (bc && myId) bc.postMessage({ me: myId, gone: true }); // me retiro del panel de las demás pestañas
             myId = null;
+            active = null;
+        }
+    }
+
+    // NUEVO: procesa una lista de hilos en orden (un solo hilo = la descarga de siempre)
+    async function processThreads(list, base) {
+        if (running) return;
+        running = true;
+        btnQueue.style.display = btnResume.style.display = btnDiscard.style.display = 'none';
+        list.forEach(T => batchTbs.add(T.threadBase));
+        lockOn();
+        // el título de la pestaña refleja el estado (cola / progreso) para verlo sin abrirla
+        const baseTitle = document.title;
+        const titleTimer = setInterval(() => { document.title = `${btnAll.textContent} · ${baseTitle}`; }, 1000);
+        try {
+            for (const T of list) {
+                let b = base;
+                if (list.length > 1) {
+                    // en una tanda, cada hilo usa su propia carpeta si el navegador aún conserva el permiso
+                    try {
+                        const h = await idbGet(baseKey(T.threadBase));
+                        if (h && (await h.queryPermission({ mode: 'readwrite' })) === 'granted') b = h;
+                    } catch (e) { /* usa la carpeta de la tanda */ }
+                }
+                try {
+                    await runOne(T, b);
+                } catch (e) {
+                    if (e && e.message === 'THREAD_BUSY') console.warn('[adjuntos] hilo ya en curso en otra pestaña, se omite:', T.title);
+                    else console.error('[adjuntos] error', T.title, e);
+                }
+                batchTbs.delete(T.threadBase);
+            }
+            if (list.length > 1) btnAll.textContent = `Tanda terminada (${list.length} hilos)`;
+        } finally {
+            batchTbs.clear();
             clearInterval(titleTimer);
             document.title = baseTitle;
             running = false;
@@ -466,7 +625,32 @@
         }
     }
 
-    btn.onclick = () => run([currentPage]);
+    // recibe la lista de páginas a procesar y, al reanudar, el handle guardado
+    // fresh = inicio manual: se descarta la caché para releer el hilo (puede tener posts nuevos); reanudar la conserva
+    async function run(pages, handle, fresh = false) {
+        if (running) return;
+        // aviso temprano si este hilo ya corre (o está en cola) en otra pestaña
+        if (await isThreadBusy(threadBase)) {
+            alert('Este hilo ya se está descargando (o está en cola) en otra pestaña.');
+            return;
+        }
+        let base = handle;
+        if (!base) {
+            // elegir carpeta base (antes de cualquier await largo, para conservar el gesto del usuario)
+            try {
+                let startIn;
+                try { startIn = await idbGet('base:last'); } catch (e) { /* sin IndexedDB */ }
+                base = await window.showDirectoryPicker(startIn ? { mode: 'readwrite', startIn } : { mode: 'readwrite' });
+            } catch (e) {
+                console.warn('[adjuntos] carpeta no elegida', e);
+                return;
+            }
+        }
+        if (fresh) { try { await idbDel(scanKey(threadBase)); } catch (e) { /* sin caché */ } }
+        return processThreads([curThread(pages)], base);
+    }
+
+    btn.onclick = () => run([currentPage], undefined, true);
 
     btnAll.onclick = () => {
         // el selector de carpeta necesita el clic reciente: se pide el rango dentro de run() solo si hace falta
@@ -479,21 +663,45 @@
         const to = Number(m[2] || m[1]);
         const pages = [];
         for (let p = Math.min(from, to); p <= Math.max(from, to); p++) pages.push(p);
-        run(pages);
+        run(pages, undefined, true);
+    };
+
+    // NUEVO: procesar toda la cola guardada desde esta pestaña, en el orden guardado
+    btnQueue.onclick = async () => {
+        if (running) return;
+        const list = candidates()
+            .filter(x => x.pages && x.pages.length)
+            .map(x => mkThread(x.threadBase, x.title, x.url, x.pages));
+        if (!list.length) return;
+        // carpeta de la tanda (con el clic hay gesto de usuario): la del primer hilo si se puede, o se elige una
+        let base = null;
+        try {
+            const h = (await idbGet(baseKey(list[0].threadBase))) || (await idbGet('base:last'));
+            if (h) {
+                let perm = await h.queryPermission({ mode: 'readwrite' });
+                if (perm !== 'granted') perm = await h.requestPermission({ mode: 'readwrite' });
+                if (perm === 'granted') base = h;
+            }
+        } catch (e) { /* se elige una carpeta */ }
+        if (!base) {
+            try { base = await window.showDirectoryPicker({ mode: 'readwrite' }); }
+            catch (e) { console.warn('[adjuntos] carpeta no elegida', e); return; }
+        }
+        processThreads(list, base);
     };
 
     // reanudar o descartar el trabajo pendiente del hilo (si lo hay)
-    btnDiscard.onclick = () => { clearJob(); btnResume.style.display = btnDiscard.style.display = 'none'; };
+    btnDiscard.onclick = () => { clearJob(threadBase); btnResume.style.display = btnDiscard.style.display = 'none'; };
 
     (async () => {
-        const job = loadJob();
+        const job = loadJob(threadBase);
         if (!job || job.threadBase !== threadBase || !job.pages || !job.pages.length) return;
-        if (!loadQueue().some(x => x.threadBase === threadBase)) queueAdd(job.pages); // trabajo previo sin entrada en la cola
-        btnResume.textContent = `Reanudar descarga (págs ${job.pages[0]}-${job.pages[job.pages.length - 1]})`;
+        if (!loadQueue().some(x => x.threadBase === threadBase)) queueAdd(curThread(job.pages)); // trabajo previo sin entrada en la cola
+        btnResume.textContent = `Reanudar descarga (págs ${job.pages[0]}-${job.pages[job.pages.length - 1]})${progressText(job, job.pages.length)}`;
         btnResume.style.display = btnDiscard.style.display = '';
 
         let handle = null;
-        try { handle = await idbGet(BASE_KEY); } catch (e) { /* sin IndexedDB */ }
+        try { handle = await idbGet(baseKey(threadBase)); } catch (e) { /* sin IndexedDB */ }
 
         btnResume.onclick = async () => {
             try {

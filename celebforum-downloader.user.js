@@ -334,6 +334,9 @@
     btnSkip.onclick = () => requestPause('next');
     btnStop.onclick = () => requestPause('all');
     resetPauseButtons();
+    // NUEVO: fuera de un hilo (portada, buscador…) la pestaña es solo un gestor de la cola: sin botones de descarga del hilo
+    const inThread = /\/threads\//.test(location.pathname);
+    if (!inThread) { btn.style.display = 'none'; btnAll.style.cssText += ';opacity:.85;cursor:default'; }
     // NUEVO: interruptor — al terminar un hilo, continuar solo con la cola guardada (se recuerda entre sesiones; por defecto activado)
     const autoBox = document.createElement('label');
     autoBox.style.cssText = 'display:flex;gap:6px;align-items:center;max-width:320px;padding:6px 10px;font:12px sans-serif;background:#222;color:#eee;border-radius:6px;cursor:pointer';
@@ -343,6 +346,24 @@
     autoChk.onchange = () => { try { localStorage.setItem('cfdl_auto', autoChk.checked ? '1' : '0'); } catch (e) { /* sin storage */ } };
     autoBox.append(autoChk, 'Continuar con la cola guardada al terminar');
     box.appendChild(autoBox);
+    // NUEVO: reanudar solo al abrir/refrescar un hilo con pendiente — por defecto DESACTIVADO (se salta el orden de la cola y las pausas)
+    const resumeBox = document.createElement('label');
+    resumeBox.style.cssText = autoBox.style.cssText;
+    const resumeChk = document.createElement('input');
+    resumeChk.type = 'checkbox';
+    try { resumeChk.checked = localStorage.getItem('cfdl_autoresume') === '1'; } catch (e) { resumeChk.checked = false; }
+    resumeChk.onchange = () => { try { localStorage.setItem('cfdl_autoresume', resumeChk.checked ? '1' : '0'); } catch (e) { /* sin storage */ } };
+    resumeBox.append(resumeChk, 'Reanudar solo al abrir un hilo pendiente');
+    box.appendChild(resumeBox);
+    // NUEVO: orden automático de la cola — retomar primero el hilo con menos páginas (opcional: por defecto DESACTIVADO; con empate, el orden guardado)
+    const sortBox = document.createElement('label');
+    sortBox.style.cssText = autoBox.style.cssText;
+    const sortChk = document.createElement('input');
+    sortChk.type = 'checkbox';
+    try { sortChk.checked = localStorage.getItem('cfdl_autosort') === '1'; } catch (e) { sortChk.checked = false; }
+    sortChk.onchange = () => { try { localStorage.setItem('cfdl_autosort', sortChk.checked ? '1' : '0'); } catch (e) { /* sin storage */ } };
+    sortBox.append(sortChk, 'Retomar primero el de menos páginas');
+    box.appendChild(sortBox);
     // NUEVO: exportar / importar el estado (cola, trabajos, progreso y análisis de páginas) a un archivo .json
     const ioRow = document.createElement('div');
     ioRow.style.cssText = 'display:flex;gap:6px';
@@ -387,7 +408,10 @@
         const live = new Set();
         peers.forEach(p => { if (Date.now() - p.seen < 10000 && p.tb) live.add(p.tb); });
         if (active) live.add(active.threadBase);
-        return loadQueue().filter(x => !live.has(x.threadBase));
+        const list = loadQueue().filter(x => !live.has(x.threadBase));
+        // con el orden automático: menos páginas primero (sort es estable: con empate se respeta el orden guardado)
+        if (sortChk.checked) list.sort((a, b) => ((a.pages || []).length || Infinity) - ((b.pages || []).length || Infinity));
+        return list;
     }
 
     // NUEVO: reordenar la cola guardada (solo afecta a los pendientes sin pestaña; el orden de la cola viva no se puede cambiar)
@@ -453,7 +477,7 @@
                 const p = (loadJob(x.threadBase) || {}).progress;
                 if (p && p.imgTotal) { imgAll += p.imgTotal; imgDone += p.imgOk || 0; } else unknown++;
             });
-            const h = add(`Pendientes guardados (${saved.length}) · ${imgDone}/${imgAll} img${unknown ? ` (+${unknown} sin contar)` : ''} — abre el hilo o usa "Procesar cola":`);
+            const h = add(`Pendientes guardados (${saved.length}) · ${imgDone}/${imgAll} img${unknown ? ` (+${unknown} sin contar)` : ''}${sortChk.checked ? ' · menos páginas primero' : ''} — abre el hilo o usa "Procesar cola":`);
             h.style.fontWeight = 'bold';
             if (held.length || pend.length) h.style.marginTop = '6px';
             // enlace-acción pequeño (▲ ▼ ✕ y orden por páginas)
@@ -464,7 +488,7 @@
                 l.onclick = ev => { ev.preventDefault(); fn(); renderQueue(); };
                 return l;
             };
-            if (saved.length > 1) {
+            if (saved.length > 1 && !sortChk.checked) { // con el orden automático, reordenar a mano no tiene efecto
                 const s = document.createElement('div');
                 s.append('Ordenar por páginas:',
                     act('menos primero ▲', 'De menos a más páginas', () => sortQueueByPages(true), '#8cf'),
@@ -479,8 +503,10 @@
                 a.textContent = `${i + 1}. ${x.title || x.threadBase}${x.threadBase === threadBase ? ' (este hilo)' : ''} — ${np} ${np === 1 ? 'pág' : 'págs'}${progressText(loadJob(x.threadBase), np)}`;
                 d.append(
                     a,
-                    act('▲', 'Subir en la cola', () => moveInQueue(x.threadBase, -1)),
-                    act('▼', 'Bajar en la cola', () => moveInQueue(x.threadBase, +1)),
+                    ...(sortChk.checked ? [] : [
+                        act('▲', 'Subir en la cola', () => moveInQueue(x.threadBase, -1)),
+                        act('▼', 'Bajar en la cola', () => moveInQueue(x.threadBase, +1))
+                    ]),
                     act('✕', 'Quitar de la cola (cancelar)', () => {
                         clearJob(x.threadBase);
                         if (x.threadBase === threadBase) btnResume.style.display = btnDiscard.style.display = 'none';
@@ -497,6 +523,10 @@
 
     let last = '';
     const refresh = () => {
+        if (!inThread) { // gestor de la cola: no hay página de hilo que analizar
+            if (!running) btnAll.textContent = 'Gestor de cola (abre un hilo o usa "Procesar cola")';
+            return;
+        }
         const g = groups(document, { seenUrls: new Set(), usedNames: new Set() });
         const txt = `Descargar página ${currentPage}: ${g.reduce((s, x) => s + x.urls.length, 0)} adjuntos (${g.length} sets)`;
         if (txt !== last) { last = txt; btn.textContent = txt; }
@@ -509,6 +539,7 @@
     async function doRun(base, T) {
         const pages = T.pages;
         btnAll.textContent = 'Iniciando...';
+        saveProgress(T.threadBase, { paused: false }); // vuelve a correr: ya no está pausado
         let threadDir = null, manifest = null;
         // NUEVO: estado del avance que se escribe en el manifest (status: in_progress | paused | stopped | complete | complete_with_failures)
         const prog = { status: 'in_progress' };
@@ -645,6 +676,7 @@
         } catch (e) {
             if (e && e.message === 'PAUSED') {
                 prog.status = 'paused';
+                saveProgress(T.threadBase, { paused: true }); // una pausa nunca se reanuda sola al refrescar
                 try { if (manifest && threadDir) await writeManifest(); } catch (e2) { /* mejor esfuerzo */ }
                 btnAll.textContent = 'Pausado: queda pendiente (ver "Pendientes guardados")';
                 return;
@@ -775,13 +807,24 @@
                 return;
             }
         }
-        if (fresh) { try { await idbDel(scanKey(threadBase)); } catch (e) { /* sin caché */ } }
+        // NUEVO: un inicio manual reemplazaría un pendiente distinto de este hilo (y su análisis): pedir confirmación
+        if (fresh) {
+            const prev = loadJob(threadBase);
+            if (prev && Array.isArray(prev.pages) && JSON.stringify(prev.pages) !== JSON.stringify(pages)) {
+                const pr = prev.progress || {};
+                const detalle = pr.imgTotal ? `, ${pr.imgOk || 0}/${pr.imgTotal} img` : '';
+                if (!confirm(`Este hilo ya tiene un pendiente (págs ${prev.pages[0]}-${prev.pages[prev.pages.length - 1]}${detalle}).\n\n` +
+                    `Iniciar de nuevo lo REEMPLAZA por las págs ${pages[0]}-${pages[pages.length - 1]} y borra su análisis guardado.\n\n¿Continuar?`)) return;
+            }
+            try { await idbDel(scanKey(threadBase)); } catch (e) { /* sin caché */ }
+        }
         return processThreads(curThread(pages), base);
     }
 
     btn.onclick = () => run([currentPage], undefined, true);
 
     btnAll.onclick = () => {
+        if (!inThread) return; // en el gestor este botón solo muestra el estado
         // el selector de carpeta necesita el clic reciente: se pide el rango dentro de run() solo si hace falta
         const max = lastPage();
         const input = prompt(`Páginas a procesar (ej. 1-${max}, 3-5 o 4):`, `1-${max}`);
@@ -910,9 +953,10 @@
             run(job.pages, handle || undefined); // sin handle válido, vuelve a abrir el selector de carpeta
         };
 
-        // si el navegador ya conserva el permiso, reanuda sola; con varias pestañas entran a la cola global
+        // CAMBIO: solo si lo activaste, el trabajo NO está pausado y el navegador ya conserva el permiso; si no, queda el botón "Reanudar"
         try {
-            if (handle && (await handle.queryPermission({ mode: 'readwrite' })) === 'granted') run(job.pages, handle);
+            const paused = !!(job.progress && job.progress.paused);
+            if (resumeChk.checked && !paused && handle && (await handle.queryPermission({ mode: 'readwrite' })) === 'granted') run(job.pages, handle);
         } catch (e) { /* pide permiso con el botón */ }
     })();
 })();

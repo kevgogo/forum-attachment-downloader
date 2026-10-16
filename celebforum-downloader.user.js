@@ -172,12 +172,50 @@
         storeQueue(q);
     };
     const queueRemove = tb => storeQueue(loadQueue().filter(x => x.threadBase !== tb));
+    // NUEVO: sincroniza cfdl_queue (orden) con las claves cfdl_job:* (trabajos reales).
+    // Los trabajos son la fuente de verdad: uno sin entrada en la cola se agrega al final; una entrada sin trabajo se quita.
+    function reconcileQueue() {
+        const jobs = new Map();
+        try {
+            Object.keys(localStorage).filter(k => k.startsWith('cfdl_job:')).forEach(k => {
+                try {
+                    const j = JSON.parse(localStorage.getItem(k));
+                    if (j && j.threadBase && Array.isArray(j.pages) && j.pages.length) jobs.set(j.threadBase, j);
+                } catch (e) { /* clave dañada: se ignora */ }
+            });
+        } catch (e) { return; }
+        const q = loadQueue();
+        let changed = false;
+        jobs.forEach((j, tb) => {
+            const e = q.find(x => x.threadBase === tb);
+            if (e) {
+                // el título guardado en el trabajo manda sobre uno provisional de la cola
+                if (j.title && e.title !== j.title) { e.title = j.title; changed = true; }
+                return;
+            }
+            // trabajos antiguos sin título: provisional = nombre del hilo en la URL; se corrige cuando el hilo se abre o se procesa
+            q.push({ threadBase: tb, url: j.url || `${location.origin}${tb}/`, title: j.title || cleanName(fallbackOf(tb)), pages: j.pages, ts: Date.now() });
+            changed = true;
+        });
+        const kept = q.filter(x => jobs.has(x.threadBase));
+        if (kept.length !== q.length) changed = true;
+        if (changed) storeQueue(kept);
+    }
+
+    // NUEVO: manda un hilo al final de la cola guardada (al pausarlo para pasar a otro)
+    const moveToEnd = tb => {
+        const q = loadQueue();
+        const i = q.findIndex(x => x.threadBase === tb);
+        if (i < 0) return;
+        q.push(q.splice(i, 1)[0]);
+        storeQueue(q);
+    };
 
     const saveJob = T => {
         // CAMBIO: conserva el progreso ya guardado si es el mismo trabajo (al reanudar no se pone a cero)
         const prev = loadJob(T.threadBase);
         const same = prev && JSON.stringify(prev.pages) === JSON.stringify(T.pages);
-        try { localStorage.setItem(jobKey(T.threadBase), JSON.stringify({ threadBase: T.threadBase, pages: T.pages, progress: same ? prev.progress : undefined })); } catch (e) { /* sin storage */ }
+        try { localStorage.setItem(jobKey(T.threadBase), JSON.stringify({ threadBase: T.threadBase, title: T.title, url: T.url, pages: T.pages, progress: same ? prev.progress : undefined })); } catch (e) { /* sin storage */ }
         queueAdd(T);
     };
     // NUEVO: resumen de progreso en localStorage (visible desde la consola y en el panel)
@@ -190,7 +228,9 @@
     const progressText = (job, np) => {
         const p = job && job.progress;
         if (!p) return '';
-        return ` · leídas ${p.pagesRead || 0}/${p.pagesTotal || np}` + (p.imgTotal ? ` · ${p.imgOk || 0}/${p.imgTotal} img` : '');
+        // con total conocido: "470/1284 img"; si aún está leyendo páginas: "1284+ img" (hasta ahora)
+        return ` · leídas ${p.pagesRead || 0}/${p.pagesTotal || np}`
+            + (p.imgTotal ? ` · ${p.imgOk || 0}/${p.imgTotal} img` : (p.imgFound ? ` · ${p.imgFound}+ img` : ''));
     };
     const clearJob = tb => {
         try { localStorage.removeItem(jobKey(tb)); } catch (e) { /* sin storage */ }
@@ -217,6 +257,7 @@
 
     // Wake Lock (evita que la pantalla/equipo se suspenda por inactividad)
     let running = false, wakeLock = null;
+    let stopReq = null; // NUEVO: null | 'next' (pausar este y pasar al siguiente) | 'all' (pausar todo)
     async function lockOn() {
         try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) { /* no soportado o denegado */ }
     }
@@ -247,6 +288,7 @@
             btnAll.textContent = '⚠ Captcha pendiente (esperando que lo resuelvas)';
             for (;;) {
                 await sleep(6000); // sondeo suave: una petición cada 6 s
+                if (stopReq) break; // pausa pedida: deja de esperar el captcha
                 try {
                     const r = await fetch(url, { credentials: 'include' });
                     try { if (r.body) r.body.cancel(); } catch (e) { /* no importa */ }
@@ -261,7 +303,9 @@
     async function fetchRetry(url) {
         let res = await fetch(url, { credentials: 'include' });
         while (isBlocked(res)) {
+            if (stopReq) throw new Error('PAUSED');
             await waitForChallenge(url, res);
+            if (stopReq) throw new Error('PAUSED');
             res = await fetch(url, { credentials: 'include' });
         }
         return res;
@@ -274,8 +318,29 @@
     const btnQueue = document.createElement('button');   // NUEVO: procesar la cola guardada desde esta pestaña
     const btnResume = document.createElement('button');  // reanudar trabajo pendiente
     const btnDiscard = document.createElement('button'); // descartar trabajo pendiente
-    [btn, btnAll, btnQueue, btnResume, btnDiscard].forEach(b => { b.style.cssText = 'padding:8px 12px'; box.appendChild(b); });
-    btnQueue.style.display = btnResume.style.display = btnDiscard.style.display = 'none';
+    const btnSkip = document.createElement('button'); // NUEVO: pausar este hilo y pasar al siguiente de la tanda
+    const btnStop = document.createElement('button'); // NUEVO: pausar todo
+    [btn, btnAll, btnSkip, btnStop, btnQueue, btnResume, btnDiscard].forEach(b => { b.style.cssText = 'padding:8px 12px'; box.appendChild(b); });
+    btnSkip.style.display = btnStop.style.display = btnQueue.style.display = btnResume.style.display = btnDiscard.style.display = 'none';
+    const SKIP_LABEL = '⏭ Pausar este y pasar al siguiente', STOP_LABEL = '⏹ Pausar todo';
+    const resetPauseButtons = () => { btnSkip.disabled = btnStop.disabled = false; btnSkip.textContent = SKIP_LABEL; btnStop.textContent = STOP_LABEL; };
+    const requestPause = mode => {
+        stopReq = mode;
+        btnSkip.disabled = btnStop.disabled = true;
+        (mode === 'next' ? btnSkip : btnStop).textContent = 'Pausando… (termina la imagen en curso)';
+    };
+    btnSkip.onclick = () => requestPause('next');
+    btnStop.onclick = () => requestPause('all');
+    resetPauseButtons();
+    // NUEVO: interruptor — al terminar un hilo, continuar solo con la cola guardada (se recuerda entre sesiones; por defecto activado)
+    const autoBox = document.createElement('label');
+    autoBox.style.cssText = 'display:flex;gap:6px;align-items:center;max-width:320px;padding:6px 10px;font:12px sans-serif;background:#222;color:#eee;border-radius:6px;cursor:pointer';
+    const autoChk = document.createElement('input');
+    autoChk.type = 'checkbox';
+    try { autoChk.checked = localStorage.getItem('cfdl_auto') !== '0'; } catch (e) { autoChk.checked = true; }
+    autoChk.onchange = () => { try { localStorage.setItem('cfdl_auto', autoChk.checked ? '1' : '0'); } catch (e) { /* sin storage */ } };
+    autoBox.append(autoChk, 'Continuar con la cola guardada al terminar');
+    box.appendChild(autoBox);
     btnDiscard.textContent = 'Descartar descarga pendiente';
     // panel con el orden de la cola global (visible en todas las pestañas)
     const panel = document.createElement('div');
@@ -294,7 +359,6 @@
 
     let myId = null;   // mi clientId de Web Locks (se conoce al entrar a la cola)
     let active = null; // NUEVO: hilo que esta pestaña está procesando ahora
-    const batchTbs = new Set(); // NUEVO: hilos de la tanda de esta pestaña que aún no terminan
     const bc = (() => { try { return new BroadcastChannel('cfdl-status'); } catch (e) { return null; } })();
     const peers = new Map(); // clientId -> { title, text, tb, seen }: lo que cada pestaña anuncia de sí misma
     if (bc) bc.onmessage = e => {
@@ -306,9 +370,9 @@
 
     // hilos guardados en la cola que ninguna pestaña (ni esta) está atendiendo ahora
     function candidates() {
-        const live = new Set(batchTbs);
+        const live = new Set();
         peers.forEach(p => { if (Date.now() - p.seen < 10000 && p.tb) live.add(p.tb); });
-        if (myId && active) live.add(active.threadBase);
+        if (active) live.add(active.threadBase);
         return loadQueue().filter(x => !live.has(x.threadBase));
     }
 
@@ -334,6 +398,7 @@
     }
 
     async function renderQueue() {
+        reconcileQueue(); // NUEVO: el panel siempre refleja lo que hay en localStorage
         let held = [], pend = [];
         if (navigator.locks) {
             try {
@@ -368,7 +433,13 @@
             pend.forEach((l, i) => add(`${i + 1}. ${info(l).name}`));
         }
         if (saved.length) {
-            const h = add('Pendientes guardados (abre el hilo o usa "Procesar cola"):');
+            // NUEVO: total general de imágenes de los pendientes (solo los que ya tienen el total conocido)
+            let imgAll = 0, imgDone = 0, unknown = 0;
+            saved.forEach(x => {
+                const p = (loadJob(x.threadBase) || {}).progress;
+                if (p && p.imgTotal) { imgAll += p.imgTotal; imgDone += p.imgOk || 0; } else unknown++;
+            });
+            const h = add(`Pendientes guardados (${saved.length}) · ${imgDone}/${imgAll} img${unknown ? ` (+${unknown} sin contar)` : ''} — abre el hilo o usa "Procesar cola":`);
             h.style.fontWeight = 'bold';
             if (held.length || pend.length) h.style.marginTop = '6px';
             // enlace-acción pequeño (▲ ▼ ✕ y orden por páginas)
@@ -455,6 +526,7 @@
             try { scan = await idbGet(scanKey(T.threadBase)); } catch (e) { /* sin IndexedDB */ }
             if (!scan || !scan.pages || Date.now() - scan.ts > SCAN_TTL) scan = { ts: Date.now(), pages: {} };
             for (const p of pages) {
+                if (stopReq) throw new Error('PAUSED');
                 let raw = scan.pages[p];
                 if (raw) {
                     btnAll.textContent = `Página ${p} ya leída (caché)`;
@@ -477,7 +549,8 @@
                     try { await idbSet(scanKey(T.threadBase), scan); } catch (e) { /* sin IndexedDB */ }
                 }
                 all.push(...applyCtx(raw, ctx, T.fallback));
-                saveProgress(T.threadBase, { pagesRead: pages.filter(q => scan.pages[q]).length, pagesTotal: pages.length });
+                // imgFound = adjuntos encontrados hasta ahora (el total real se conoce al leer todas las páginas)
+                saveProgress(T.threadBase, { pagesRead: pages.filter(q => scan.pages[q]).length, pagesTotal: pages.length, imgFound: all.reduce((s, x) => s + x.urls.length, 0) });
             }
             const total = all.reduce((s, x) => s + x.urls.length, 0);
             let ok = 0;
@@ -497,6 +570,7 @@
                 };
                 const pad = Math.max(3, String(urls.length).length); // ancho del número (001, 002, ...)
                 for (const [i, url] of urls.entries()) {
+                    if (stopReq) throw new Error('PAUSED'); // NUEVO: pausa pedida; el trabajo queda pendiente
                     // nombre según el orden de aparición en el post
                     const fileName = `${String(i + 1).padStart(pad, '0')}.jpg`;
                     // retomar — si el archivo ya existe y no está vacío, se salta
@@ -507,7 +581,7 @@
 
                     // hasta 3 intentos con espera creciente
                     let saved = false;
-                    for (let attempt = 1; attempt <= 3 && !saved; attempt++) {
+                    for (let attempt = 1; attempt <= 3 && !saved && !stopReq; attempt++) {
                         try {
                             // si Cloudflare muestra el desafío, abrir la imagen en una pestaña, esperar y reintentar
                             const res = await fetchRetry(url);
@@ -530,6 +604,7 @@
                         }
                         if (!saved && attempt < 3) await sleep(2000 * attempt);
                     }
+                    if (!saved && stopReq) throw new Error('PAUSED'); // se pausó a mitad de los intentos: no cuenta como fallo
                     if (!saved) { mark(fileName, url, 'failed'); failed.push({ carpeta: setFolder, archivo: fileName, url }); }
                     await sleep(800);
                 }
@@ -541,6 +616,11 @@
             if (failed.length) console.table(failed);
             clearJob(T.threadBase); // terminó con normalidad: ya no hay nada pendiente
         } catch (e) {
+            if (e && e.message === 'PAUSED') {
+                try { if (manifest && threadDir) await writeManifest(); } catch (e2) { /* mejor esfuerzo */ }
+                btnAll.textContent = 'Pausado: queda pendiente (ver "Pendientes guardados")';
+                return;
+            }
             // error inesperado (p. ej. permiso de carpeta): el trabajo queda pendiente para reanudar
             console.error('[adjuntos] detenido', e);
             try { if (manifest && threadDir) await writeManifest(); } catch (e2) { /* mejor esfuerzo */ }
@@ -587,21 +667,33 @@
         }
     }
 
-    // NUEVO: procesa una lista de hilos en orden (un solo hilo = la descarga de siempre)
-    async function processThreads(list, base) {
+    // NUEVO: procesa hilos uno tras otro. El primero viene dado; los siguientes se toman de la cola guardada EN ORDEN
+    // en el momento de necesitarlos, así ▲ ▼ ✕ y "ordenar por páginas" afectan también a lo que falta de la tanda.
+    // continueQueue = seguir con la cola al terminar cada hilo (botón "Procesar cola"); si no, solo si la casilla está activada.
+    async function processThreads(first, base, continueQueue = false) {
         if (running) return;
         running = true;
+        const attempted = new Set(); // evita repetir un hilo que quedó pendiente por un error en esta misma cadena
+        stopReq = null;
+        resetPauseButtons();
         btnQueue.style.display = btnResume.style.display = btnDiscard.style.display = 'none';
-        list.forEach(T => batchTbs.add(T.threadBase));
+        btnSkip.style.display = btnStop.style.display = ''; // controles de pausa mientras corre
         lockOn();
         // el título de la pestaña refleja el estado (cola / progreso) para verlo sin abrirla
         const baseTitle = document.title;
         const titleTimer = setInterval(() => { document.title = `${btnAll.textContent} · ${baseTitle}`; }, 1000);
+        const pickNext = () => {
+            const x = candidates().find(c => !attempted.has(c.threadBase) && c.pages && c.pages.length);
+            return x ? mkThread(x.threadBase, x.title, x.url, x.pages) : null;
+        };
+        let done = 0;
         try {
-            for (const T of list) {
+            let T = first;
+            while (T) {
+                attempted.add(T.threadBase);
                 let b = base;
-                if (list.length > 1) {
-                    // en una tanda, cada hilo usa su propia carpeta si el navegador aún conserva el permiso
+                if (done > 0) {
+                    // a partir del segundo, cada hilo usa su propia carpeta si el navegador aún conserva el permiso
                     try {
                         const h = await idbGet(baseKey(T.threadBase));
                         if (h && (await h.queryPermission({ mode: 'readwrite' })) === 'granted') b = h;
@@ -613,11 +705,19 @@
                     if (e && e.message === 'THREAD_BUSY') console.warn('[adjuntos] hilo ya en curso en otra pestaña, se omite:', T.title);
                     else console.error('[adjuntos] error', T.title, e);
                 }
-                batchTbs.delete(T.threadBase);
+                done++;
+                if (stopReq === 'all') break; // los hilos que faltan quedan pendientes en la cola guardada
+                if (stopReq === 'next') { // este hilo pasa al final de la cola y sigue el siguiente
+                    moveToEnd(T.threadBase);
+                    stopReq = null;
+                    resetPauseButtons();
+                }
+                T = (continueQueue || autoChk.checked) ? pickNext() : null;
             }
-            if (list.length > 1) btnAll.textContent = `Tanda terminada (${list.length} hilos)`;
+            if (done > 1 && stopReq !== 'all') btnAll.textContent = `Tanda terminada (${done} hilos)`;
         } finally {
-            batchTbs.clear();
+            stopReq = null;
+            btnSkip.style.display = btnStop.style.display = 'none';
             clearInterval(titleTimer);
             document.title = baseTitle;
             running = false;
@@ -647,7 +747,7 @@
             }
         }
         if (fresh) { try { await idbDel(scanKey(threadBase)); } catch (e) { /* sin caché */ } }
-        return processThreads([curThread(pages)], base);
+        return processThreads(curThread(pages), base);
     }
 
     btn.onclick = () => run([currentPage], undefined, true);
@@ -687,7 +787,7 @@
             try { base = await window.showDirectoryPicker({ mode: 'readwrite' }); }
             catch (e) { console.warn('[adjuntos] carpeta no elegida', e); return; }
         }
-        processThreads(list, base);
+        processThreads(list[0], base, true);
     };
 
     // reanudar o descartar el trabajo pendiente del hilo (si lo hay)
@@ -696,7 +796,14 @@
     (async () => {
         const job = loadJob(threadBase);
         if (!job || job.threadBase !== threadBase || !job.pages || !job.pages.length) return;
-        if (!loadQueue().some(x => x.threadBase === threadBase)) queueAdd(curThread(job.pages)); // trabajo previo sin entrada en la cola
+        // NUEVO: al abrir un hilo con trabajo pendiente, se guarda su título real (también en trabajos antiguos que no lo tenían)
+        const realTitle = threadName();
+        if (job.title !== realTitle) {
+            job.title = realTitle;
+            job.url = `${location.origin}${threadBase}/`;
+            try { localStorage.setItem(jobKey(threadBase), JSON.stringify(job)); } catch (e) { /* sin storage */ }
+        }
+        queueAdd(curThread(job.pages)); // crea o actualiza la entrada (conserva su lugar en la cola)
         btnResume.textContent = `Reanudar descarga (págs ${job.pages[0]}-${job.pages[job.pages.length - 1]})${progressText(job, job.pages.length)}`;
         btnResume.style.display = btnDiscard.style.display = '';
 

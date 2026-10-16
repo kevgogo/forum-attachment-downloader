@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         Celebforum downloader
 // @namespace    http://tampermonkey.net/
-// @version      2026.10.16.1
+// @version      2026.10.16.2
 // @description  try to take over the world!
 // @author       kevgogo
+// @license      CC-BY-NC-SA-4.0
 // @homepageURL  https://github.com/kevgogo/forum-attachment-downloader
 // @supportURL   https://github.com/kevgogo/forum-attachment-downloader/issues
 // @updateURL    https://raw.githubusercontent.com/kevgogo/forum-attachment-downloader/main/celebforum-downloader.user.js
@@ -15,6 +16,8 @@
 // @run-at       document-idle
 // ==/UserScript==
 
+// Copyright (c) 2026 kevgogo — Licencia CC BY-NC-SA 4.0 (https://creativecommons.org/licenses/by-nc-sa/4.0/)
+// Uso no comercial; los derivados deben mantener esta misma licencia. Texto completo en el archivo LICENSE del repositorio.
 
 (function () {
     // CAMBIO: acepta cualquier documento (la actual o una página traída con fetch) y resuelve el href a absoluto

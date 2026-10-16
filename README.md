@@ -64,6 +64,16 @@ Opciones (casillas en el panel):
 
 Úsalo solo con contenido al que tengas acceso legítimo y respetando los términos del sitio. Las verificaciones y captchas están para que las resuelva una persona, y el script no las evita.
 
+## Licencia
+
+Copyright (c) 2026 kevgogo. Distribuido bajo [Creative Commons Atribución-NoComercial-CompartirIgual 4.0 Internacional (CC BY-NC-SA 4.0)](https://creativecommons.org/licenses/by-nc-sa/4.0/deed.es). Texto completo en [`LICENSE`](LICENSE).
+
+En resumen:
+
+- Puedes **copiar, usar y modificar** el script, dando crédito a su autor.
+- **No** puedes usarlo con fines comerciales.
+- Si lo modificas o lo redistribuyes, debes hacerlo bajo **esta misma licencia**.
+
 ## Versiones y actualizaciones
 
 El campo `@version` debe **aumentar** en cada cambio que quieras que Tampermonkey detecte. Formato usado: `AAAA.MM.DD.N`.

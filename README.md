@@ -1,5 +1,7 @@
 # forum-attachment-downloader
 
+[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+
 Userscript de [Tampermonkey](https://www.tampermonkey.net/) que descarga los **adjuntos de imágenes de los hilos** de un foro XenForo (`celebforum.cc`) y los guarda **ordenados en carpetas** de tu disco: una carpeta por hilo y, dentro, una por post.
 
 Corre dentro del navegador, con tu propia sesión iniciada. No usa servidores externos ni guarda tus credenciales.

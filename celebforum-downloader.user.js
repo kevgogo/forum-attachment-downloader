@@ -151,6 +151,8 @@
 
     const idbDel = async k => { const db = await idb(); return new Promise((res, rej) => { const t = db.transaction('kv', 'readwrite'); t.objectStore('kv').delete(k); t.oncomplete = () => res(); t.onerror = () => rej(t.error); }); };
 
+    const idbKeys = async () => { const db = await idb(); return new Promise((res, rej) => { const q = db.transaction('kv').objectStore('kv').getAllKeys(); q.onsuccess = () => res(q.result); q.onerror = () => rej(q.error); }); };
+
     // NUEVO: caché del escaneo por hilo (IndexedDB): qué páginas ya se leyeron y qué adjuntos tenían
     const scanKey = tb => `scan:${tb}`;
     const SCAN_TTL = 3 * 24 * 3600 * 1000; // pasado este tiempo se vuelve a leer (el hilo pudo cambiar)
@@ -341,6 +343,18 @@
     autoChk.onchange = () => { try { localStorage.setItem('cfdl_auto', autoChk.checked ? '1' : '0'); } catch (e) { /* sin storage */ } };
     autoBox.append(autoChk, 'Continuar con la cola guardada al terminar');
     box.appendChild(autoBox);
+    // NUEVO: exportar / importar el estado (cola, trabajos, progreso y análisis de páginas) a un archivo .json
+    const ioRow = document.createElement('div');
+    ioRow.style.cssText = 'display:flex;gap:6px';
+    const btnExport = document.createElement('button');
+    const btnImport = document.createElement('button');
+    btnExport.textContent = '⬇ Exportar estado';
+    btnImport.textContent = '⬆ Importar estado';
+    [btnExport, btnImport].forEach(b => { b.style.cssText = 'padding:6px 10px;flex:1'; ioRow.appendChild(b); });
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file'; fileInput.accept = 'application/json,.json'; fileInput.style.display = 'none';
+    ioRow.appendChild(fileInput);
+    box.appendChild(ioRow);
     btnDiscard.textContent = 'Descartar descarga pendiente';
     // panel con el orden de la cola global (visible en todas las pestañas)
     const panel = document.createElement('div');
@@ -496,9 +510,12 @@
         const pages = T.pages;
         btnAll.textContent = 'Iniciando...';
         let threadDir = null, manifest = null;
+        // NUEVO: estado del avance que se escribe en el manifest (status: in_progress | paused | stopped | complete | complete_with_failures)
+        const prog = { status: 'in_progress' };
         // escribe manifest.json en la carpeta del hilo
         const writeManifest = async () => {
             manifest.updatedAt = new Date().toISOString();
+            manifest.progress = Object.assign({}, prog);
             manifest.sets.forEach(s => s.files.sort((a, b) => a.file.localeCompare(b.file)));
             const fh = await threadDir.getFileHandle('manifest.json', { create: true });
             const w = await fh.createWritable();
@@ -555,8 +572,16 @@
             const total = all.reduce((s, x) => s + x.urls.length, 0);
             let ok = 0;
             // NUEVO: progreso de imágenes en localStorage (cada 10, y al cerrar cada set)
-            const tick = force => { if (force || ok % 10 === 0) saveProgress(T.threadBase, { imgOk: ok, imgTotal: total, setsTotal: all.length }); };
+            const tick = force => {
+                prog.imagesOk = ok; // el manifest siempre lleva el último valor (se escribe al cerrar cada set o al pausar)
+                if (force || ok % 10 === 0) saveProgress(T.threadBase, { imgOk: ok, imgTotal: total, setsTotal: all.length });
+            };
+            Object.assign(prog, {
+                pagesRead: pages.filter(q => scan.pages[q]).length, pagesTotal: pages.length,
+                setsTotal: all.length, imagesTotal: total, imagesOk: 0, imagesFailed: 0
+            });
             tick(true);
+            await writeManifest(); // deja constancia de "in_progress" y del total antes de empezar a descargar
             const failed = []; // imágenes que no se pudieron guardar tras los reintentos
             for (const { name: setFolder, urls, title, postId, postUrl } of all) {
                 const dir = await threadDir.getDirectoryHandle(setFolder, { create: true });
@@ -609,20 +634,24 @@
                     await sleep(800);
                 }
                 tick(true);
+                prog.imagesFailed = failed.length;
                 await writeManifest(); // se actualiza al terminar cada set
             }
+            Object.assign(prog, { status: failed.length ? 'complete_with_failures' : 'complete', imagesOk: ok, imagesFailed: failed.length });
             await writeManifest();
             btnAll.textContent = `Listo: ${ok}/${total} en ${all.length} carpetas` + (failed.length ? ` — ${failed.length} fallaron (ver consola)` : '');
             if (failed.length) console.table(failed);
             clearJob(T.threadBase); // terminó con normalidad: ya no hay nada pendiente
         } catch (e) {
             if (e && e.message === 'PAUSED') {
+                prog.status = 'paused';
                 try { if (manifest && threadDir) await writeManifest(); } catch (e2) { /* mejor esfuerzo */ }
                 btnAll.textContent = 'Pausado: queda pendiente (ver "Pendientes guardados")';
                 return;
             }
             // error inesperado (p. ej. permiso de carpeta): el trabajo queda pendiente para reanudar
             console.error('[adjuntos] detenido', e);
+            prog.status = 'stopped';
             try { if (manifest && threadDir) await writeManifest(); } catch (e2) { /* mejor esfuerzo */ }
             btnAll.textContent = 'Detenido (ver consola). Recarga y pulsa Reanudar';
         }
@@ -788,6 +817,67 @@
             catch (e) { console.warn('[adjuntos] carpeta no elegida', e); return; }
         }
         processThreads(list[0], base, true);
+    };
+
+    // NUEVO: exportar el estado completo (excepto las carpetas base, que son permisos del navegador y no se pueden exportar)
+    async function exportState() {
+        const jobs = {};
+        Object.keys(localStorage).filter(k => k.startsWith('cfdl_job:')).forEach(k => {
+            try { jobs[k] = JSON.parse(localStorage.getItem(k)); } catch (e) { /* clave dañada */ }
+        });
+        const scans = {};
+        try {
+            for (const k of await idbKeys()) if (String(k).startsWith('scan:')) scans[k] = await idbGet(k);
+        } catch (e) { /* sin IndexedDB: se exporta sin análisis */ }
+        const data = { app: 'celebforum-downloader', version: 1, exportedAt: new Date().toISOString(), auto: autoChk.checked, queue: loadQueue(), jobs, scans };
+        const d = new Date();
+        const p2 = n => String(n).padStart(2, '0');
+        const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}`;
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(new Blob([JSON.stringify(data)], { type: 'application/json' }));
+        a.download = `cfdl-estado-${stamp}.json`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    }
+
+    // NUEVO: importar; no pisa lo que ya existe (trabajos) ni un análisis más completo que el importado
+    async function importState(file) {
+        let data;
+        try { data = JSON.parse(await file.text()); } catch (e) { alert('El archivo no es un JSON válido.'); return; }
+        if (!data || data.app !== 'celebforum-downloader' || typeof data.jobs !== 'object') { alert('No parece un export de este script.'); return; }
+        let jobsNew = 0, jobsSkip = 0, scansNew = 0;
+        for (const [k, j] of Object.entries(data.jobs || {})) {
+            if (!k.startsWith('cfdl_job:') || !j || !Array.isArray(j.pages) || !j.pages.length) continue;
+            if (localStorage.getItem(k)) { jobsSkip++; continue; }
+            try { localStorage.setItem(k, JSON.stringify(j)); jobsNew++; } catch (e) { /* sin espacio */ }
+        }
+        // la cola respeta el orden exportado para los hilos que faltaban
+        const q = loadQueue();
+        (Array.isArray(data.queue) ? data.queue : []).forEach(e => {
+            if (e && e.threadBase && localStorage.getItem(jobKey(e.threadBase)) && !q.some(x => x.threadBase === e.threadBase)) q.push(e);
+        });
+        storeQueue(q);
+        for (const [k, s] of Object.entries(data.scans || {})) {
+            if (!k.startsWith('scan:') || !s || !s.pages) continue;
+            try {
+                const cur = await idbGet(k);
+                if (cur && cur.pages && Object.keys(cur.pages).length >= Object.keys(s.pages).length) continue; // ya hay uno igual o mejor
+                await idbSet(k, Object.assign({}, s, { ts: Date.now() })); // fecha de hoy: si no, la caché de 3 días podría descartarse al instante
+                scansNew++;
+            } catch (e) { /* sin IndexedDB */ }
+        }
+        reconcileQueue();
+        renderQueue();
+        alert(`Importado: ${jobsNew} trabajos nuevos (${jobsSkip} ya existían) y ${scansNew} análisis de hilos.\nPara continuar, pulsa "Procesar cola guardada" y elige la carpeta base.`);
+    }
+    btnExport.onclick = () => exportState();
+    btnImport.onclick = () => fileInput.click();
+    fileInput.onchange = () => {
+        const f = fileInput.files && fileInput.files[0];
+        fileInput.value = ''; // permite volver a elegir el mismo archivo
+        if (f) importState(f);
     };
 
     // reanudar o descartar el trabajo pendiente del hilo (si lo hay)
